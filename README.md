@@ -2,14 +2,15 @@
 
 Foundation and ingestion implementation for [the project plan](RAG_IMPLEMENTATION_PLAN.md).
 
-Accepted next design: [incremental ingestion, versioning, and active/fallback lifecycle](docs/INCREMENTAL_INGESTION.md).
-This design is documented but not implemented; the ingestion commands below still use full snapshots.
+Implemented lifecycle: [incremental ingestion, versioning, and active/fallback lifecycle](docs/INCREMENTAL_INGESTION.md).
+Normal ingestion applies document patches; full generation rebuilds are explicit.
 
 Implemented: typed configuration and records, text/Markdown/PDF parsing, semantic chunking with
 LangChain recursive character splitting,
 local embeddings, persistent Qdrant storage, SQLite manifest and embedding cache, atomic publication
 of corpus generations, and a BioASQ dataset adapter. The vector query adapter delegates to Qdrant's
-SDK. Query-text orchestration, hybrid retrieval, reranking, MCP, and answer generation are later milestones.
+SDK. A guarded dense retrieval context now embeds queries and verifies versions. Hybrid retrieval,
+reranking, MCP, and answer generation remain later milestones.
 
 ## Setup
 
@@ -34,7 +35,8 @@ The remote service stores vectors **and chunk text**; it does not read this mach
 
 ```sh
 uv run rag storage-status --collection example
-uv run rag ingest --directory tests/fixtures/documents --collection example
+uv run rag ingest --directory tests/fixtures/documents --collection example \
+  --available-storage-bytes "$QDRANT_FREE_BYTES"
 uv run rag status --collection example
 ```
 
@@ -46,14 +48,41 @@ explicit development/test option: `--storage embedded`. It is not the production
 All CLI global options precede the command:
 
 ```sh
-uv run rag --data-dir .data-experiment ingest --directory ./documents --collection papers
+uv run rag --data-dir .data-experiment ingest --directory ./documents --collection papers \
+  --available-storage-bytes "$QDRANT_FREE_BYTES"
 ```
 
-**Each ingestion replaces the collection's entire active snapshot.** Supply the complete desired
-source set on every run. Removing a document from that set removes it from the new active generation.
-Reingesting unchanged inputs is a no-op; changed snapshots reuse cached embeddings for unchanged
-text. An empty JSONL requires `--allow-empty` to clear a collection. Empty or unreadable local
-documents fail the run and leave the previous generation active.
+**Ingestion is incremental by default.** Supply new or changed documents; missing IDs are retained.
+Unchanged normalized documents skip chunking, embedding, and vector writes. Citation-only metadata
+changes update payloads without embedding. Supply `--delete-document-id ID` for explicit deletions.
+Deleting the last document additionally requires `--allow-empty`.
+
+Set `QDRANT_FREE_BYTES` above to measured free disk space from the hosting dashboard. Remote bootstrap
+and full rebuilds require `--available-storage-bytes`; this value is checked against a conservative
+staged-size estimate, not treated as an automatic measurement. It is optional for ordinary patches; when supplied, the staged additional-storage estimate is also checked before mutation.
+The CLI does not automatically load `.env`; export its variables in your shell or deployment environment.
+
+```sh
+# Patch and explicit deletion; repeat the deletion option for multiple IDs.
+uv run rag ingest --documents changed-documents.jsonl --collection papers --delete-document-id old-id
+
+# Complete input set, explicit new generation (required for model/chunking changes).
+uv run rag ingest --documents all-documents.jsonl --collection papers --full-rebuild \
+  --available-storage-bytes "$QDRANT_FREE_BYTES"
+
+# Inspect maintenance state or replay a failed operation without loading a model.
+uv run rag status --collection papers
+uv run rag recover --collection papers
+
+# Explicitly restore the older inactive snapshot; newer knowledge may be lost.
+uv run rag rollback --collection papers
+uv run rag cleanup --collection papers
+```
+
+Bootstrap creates one active collection. Full rebuilds retain the former active as the inactive
+fallback, then retire the older fallback. The fallback does not receive incremental changes.
+Interrupted mutations keep retrieval paused until `recover` or explicit `rollback` succeeds.
+A preparation failure before remote mutation leaves the existing index available.
 
 ## Preview and configure chunking
 
@@ -74,8 +103,8 @@ group when both the overlap and total token budgets permit it. It never crosses 
 boundary. The old `--chunking-strategy token` remains available as an evaluation baseline.
 
 Semantic embeddings and final chunk embeddings share a validated, batched cache. CLI results report
-their computation counts separately. An unchanged semantic run can repeat segmentation using cached
-sentence contexts without new inference. Changing chunking settings produces a new index generation.
+their computation counts separately. Unchanged documents skip semantic segmentation entirely.
+Changing chunking settings requires an explicit `--full-rebuild`.
 
 For the already downloaded model, preview can run entirely offline:
 
@@ -83,6 +112,14 @@ For the already downloaded model, preview can run entirely offline:
 uv run rag preview-chunks --file tests/fixtures/chunking/topics.txt \
   --offline --model-revision 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
 ```
+
+## Latest hosted smoke result
+
+A small real-server run completed with **21 valid passages / 60 chunks**. The unchanged rerun skipped
+all documents, and three selected questions retrieved labelled evidence. The run exposed placeholder
+passages in the source export; these are now rejected. Use the corrected export at
+`.data/datasets/bioasq/validated-224a87f/` or re-export with the updated adapter.
+See [the full smoke-test report](docs/SMOKE_TEST_RESULTS.md), including data-quality and evaluation limits.
 
 ## Prepare BioASQ
 
@@ -105,7 +142,8 @@ The returned `output` directory contains:
 Use the actual output path printed by the command:
 
 ```sh
-uv run rag ingest --documents .data/datasets/bioasq/EXPORT_ID/documents.jsonl --collection bioasq
+uv run rag ingest --documents .data/datasets/bioasq/EXPORT_ID/documents.jsonl --collection bioasq \
+  --available-storage-bytes "$QDRANT_FREE_BYTES"
 ```
 
 For a small ingestion smoke test, run `prepare-bioasq --max-passages 100`. It still downloads the
@@ -130,26 +168,43 @@ src/rag_service/
   ingestion/                     # source adapters, normalization, orchestration
   chunking/                      # semantic boundaries, LangChain fallback, previews, source spans
   embeddings/                    # Sentence Transformers adapter and shared embedding cache
-  storage/                       # SQLite and Qdrant adapters
+  storage/                       # SQLite embedding/audit cache and Qdrant adapter
+  retrieval/                     # guarded query embedding and integrity checks
   cli.py                         # dependency composition and commands
 tests/                           # offline correctness and local Qdrant integration tests
 ```
 
-Ingestion stages raw and normalized documents plus chunks in `.data/generations/ID/`. Chunk offsets
-refer to the normalized text, not raw PDF bytes. PDF pages are separate documents with explicit
-page numbers. Markdown headings are retained as metadata and stay attached to their section body
-where the budget allows. Oversized code blocks and tables may be split. Titles/headings are not prepended to
-embedding input in this version, so the token budget applies directly to chunk text.
+Ingestion writes durable, checksummed replay artifacts and document manifests in
+`.data/operations/ID/`. `.data/lifecycle.sqlite3` holds coordinator identity, counters, publication
+pointers, and the operation journal; `.data/manifest.sqlite3` retains the embedding cache and legacy
+run audit. Back up both databases and their artifacts together. Do not delete the lifecycle ledger
+and attempt to adopt an existing remote index: ownership/publication mismatch is rejected.
+Legacy indexes require a new corpus name or a separately designed migration.
 
-Each generation gets its own Qdrant collection. After vector-count verification, Qdrant atomically
-switches the active alias. Collection metadata contains the model revision and corpus identity, so
-query workers need neither the local SQLite manifest nor the ingestion machine's directory. Readers
-resolve the alias once per request and pin the physical generation throughout. SQLite remains a local
-audit and embedding cache. Remote publication timeouts are retained as `publication_pending` for
-reconciliation. A local file lock protects one work directory; deployment must allow only one writer
-per corpus. Old and failed generations are retained for inspection; garbage
-collection and secure physical deletion are not implemented yet. Logical deletion from a new
-snapshot does not erase retained historical data.
+Chunk offsets refer to normalized text. PDF pages retain page provenance; Markdown sections retain
+headings. Oversized code/tables may split. Titles and citation metadata are not embedded.
+
+All readers and writers must use **one coordinator directory on one host**. `RetrievalService.retrieve`
+is a context manager: keep it open through reranking/context assembly. It checks the exact model,
+published revision, document versions, and payload identities against the committed manifest. It
+serializes retrieval requests using the same gate that ingestion drains before mutation. Direct
+`store.search` is a low-level SDK adapter and bypasses those guarantees. Multiple independent MCP
+hosts require shared database coordination before deployment; local file locks are insufficient.
+
+```python
+from rag_service.retrieval.service import RetrievalService
+
+service = RetrievalService(data_dir, store)
+with service.retrieve("papers", "What is the backup policy?", matching_embedder) as (index, hits):
+    # Build context inside this block. Future result caches must include index.ingestion_revision.
+    context = "\n\n".join(hit.chunk.text for hit in hits)
+```
+
+Every incremental mutation verifies the complete payload/ID set (a deliberate prototype tradeoff).
+Full builds prepare embeddings while reads remain available, then hold the gate during remote upload,
+validation, and publication. There is no distributed transaction between SQLite and Qdrant: durable
+replay and fail-closed retrieval handle interruptions. Cleanup removes retired remote collections;
+local audit/artifact retention and secure physical erasure are not automated.
 
 Normalized source records and chunk JSONL can feed the future sparse/BM25 encoder. Qdrant will own
 the sparse index and hybrid rank fusion as well. Those stages and the remote MCP service are not
@@ -176,3 +231,7 @@ See [the validation report](docs/INGESTION_VALIDATION.md) for the verified datas
 
 Dependency caches and downloaded data are ignored by Git. Runtime source data is not published with
 the code. Run status inspection without loading the embedding model.
+
+Retrieval and optional CrossEncoder reranking are available with an offline human-review
+workflow. See [retrieval usage and evaluation](docs/RETRIEVAL.md). Wait for the full ingestion
+to finish before exporting results from the hosted collection.

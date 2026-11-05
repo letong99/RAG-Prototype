@@ -1,7 +1,18 @@
 # Incremental ingestion and generation lifecycle
 
-Status: accepted design; not implemented. This document supersedes whole-corpus rebuilding as
-the planned default. The existing CLI still rebuilds a full collection when its fingerprint changes.
+Status: implemented for a single-host coordinator. Incremental patches are the default; explicit
+full rebuilds rotate active/fallback collections. The distributed deployment described below remains
+future work. See the [README](../README.md) for commands.
+
+Implementation boundaries: retrieval requests are serialized by a process-safe file lock and must
+share the coordinator directory. Preparation runs before maintenance; remote upload, validation, and
+publication all run inside the window, including full rebuild uploads. Each mutation validates the
+complete stored payload/ID set. Remote bootstrap/full builds require operator-supplied measured free
+space, checked against a conservative estimate. Incremental runs can supply the same allowance;
+consecutive vector upserts are batched into groups of at most 256 without crossing deletion or
+metadata-update boundaries. Staging and upload progress are logged. Full-source deletion synchronization is not exposed;
+use explicit deletion IDs or a full rebuild. The lifecycle schema is additive beside the legacy audit
+DB; legacy remote generations cannot be silently adopted. Local artifact retention is not automated.
 
 ## Decisions
 
@@ -175,8 +186,8 @@ versioning, and recovery semantics match this design; avoid a second competing r
    representative BioASQ pilot. Measure skip rate, embedding calls, update duration, downtime, disk
    growth, and retrieval recall/citation correctness against a clean full rebuild of the same corpus.
 
-Local Qdrant tests cannot establish distributed coordination or server disk usage. No full BioASQ
-ingestion, remote mutation, dependency installation, or runtime change is part of this documentation.
+Local Qdrant tests cannot establish distributed coordination or server disk usage. No full BioASQ ingestion or hosted mutation was performed during this implementation. Runtime code
+and offline fixture tests implement the lifecycle; real-server mutation tests remain opt-in.
 
 ## References
 

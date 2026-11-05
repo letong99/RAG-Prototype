@@ -14,4 +14,10 @@ def test_overlap_validation() -> None:
 
 def test_status_works_without_a_model(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--data-dir", str(tmp_path), "status"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"active": None, "history": []}
+    assert json.loads(capsys.readouterr().out) == {
+        "active": None,
+        "fallback": None,
+        "maintenance": False,
+        "pending_operation": None,
+        "history": [],
+    }

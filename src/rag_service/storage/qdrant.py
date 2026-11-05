@@ -1,6 +1,6 @@
 """One immutable Qdrant collection per ingestion generation."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
@@ -11,6 +11,10 @@ from rag_service.schemas import Chunk, IndexMetadata, SearchHit
 
 
 class QdrantVectorStore:
+    @property
+    def remote(self) -> bool:
+        return self._remote
+
     def __init__(
         self,
         *,
@@ -56,6 +60,10 @@ class QdrantVectorStore:
             vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE),
             metadata={"rag": metadata.model_dump()} if metadata else None,
         )
+        self.ensure_indexes(generation_id)
+
+    def ensure_indexes(self, generation_id: str) -> None:
+        """Idempotently complete setup after a lost collection-creation acknowledgement."""
         if self._remote:
             # The server maintains these indexes and its vector/HNSW indexes.
             for field in ("document_id", "semantic_group_id"):
@@ -94,10 +102,28 @@ class QdrantVectorStore:
         if self.count(index.generation_id) != index.chunks:
             raise RuntimeError("Stored vector count does not match staged chunk count")
         alias = self.alias_name(index.collection)
+        aliases = {
+            item.alias_name: item.collection_name for item in self._client.get_aliases().aliases
+        }
+        target = self.collection_name(index.generation_id)
+        if aliases.get(alias) == target:
+            return
         operations: list[models.CreateAliasOperation | models.DeleteAliasOperation] = []
-        if any(item.alias_name == alias for item in self._client.get_aliases().aliases):
+        fallback = f"rag_inactive_{index.collection}"
+        if fallback in aliases:
+            operations.append(
+                models.DeleteAliasOperation(delete_alias=models.DeleteAlias(alias_name=fallback))
+            )
+        if alias in aliases:
             operations.append(
                 models.DeleteAliasOperation(delete_alias=models.DeleteAlias(alias_name=alias))
+            )
+            operations.append(
+                models.CreateAliasOperation(
+                    create_alias=models.CreateAlias(
+                        collection_name=aliases[alias], alias_name=fallback
+                    )
+                )
             )
         operations.append(
             models.CreateAliasOperation(
@@ -108,6 +134,91 @@ class QdrantVectorStore:
             )
         )
         self._client.update_collection_aliases(change_aliases_operations=operations)
+
+    def exists(self, generation_id: str) -> bool:
+        return bool(self._client.collection_exists(self.collection_name(generation_id)))
+
+    def restore(self, index: IndexMetadata) -> None:
+        """Activate a fallback without advertising a possibly damaged former active as fallback."""
+        names = {self.alias_name(index.collection), f"rag_inactive_{index.collection}"}
+        operations: list[models.CreateAliasOperation | models.DeleteAliasOperation] = [
+            models.DeleteAliasOperation(delete_alias=models.DeleteAlias(alias_name=item.alias_name))
+            for item in self._client.get_aliases().aliases
+            if item.alias_name in names
+        ]
+        operations.append(
+            models.CreateAliasOperation(
+                create_alias=models.CreateAlias(
+                    collection_name=self.collection_name(index.generation_id),
+                    alias_name=self.alias_name(index.collection),
+                )
+            )
+        )
+        self._client.update_collection_aliases(change_aliases_operations=operations)
+
+    def update_index(self, index: IndexMetadata) -> None:
+        self._client.update_collection(
+            self.collection_name(index.generation_id), metadata={"rag": index.model_dump()}
+        )
+
+    def delete_chunks(self, generation_id: str, chunk_ids: Sequence[str]) -> None:
+        if chunk_ids:
+            self._client.delete(
+                self.collection_name(generation_id),
+                points_selector=models.PointIdsList(
+                    points=[str(uuid5(NAMESPACE_URL, value)) for value in chunk_ids]
+                ),
+                wait=True,
+            )
+
+    def iter_chunks(self, generation_id: str, document_id: str | None = None) -> Iterator[Chunk]:
+        query_filter = (
+            None
+            if document_id is None
+            else models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="document_id", match=models.MatchValue(value=document_id)
+                    )
+                ]
+            )
+        )
+        offset: int | str | None = None
+        while True:
+            records, next_offset = self._client.scroll(
+                self.collection_name(generation_id),
+                scroll_filter=query_filter,
+                offset=offset,
+                limit=256,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for record in records:
+                chunk = Chunk.model_validate(record.payload)
+                if str(record.id) != str(uuid5(NAMESPACE_URL, chunk.chunk_id)):
+                    raise RuntimeError("Stored point identity disagrees with chunk payload")
+                yield chunk
+            if next_offset is None:
+                break
+            if not isinstance(next_offset, (int, str)):
+                raise RuntimeError("Unsupported scroll offset")
+            offset = next_offset
+
+    def update_chunks(self, generation_id: str, chunks: Sequence[Chunk]) -> None:
+        for chunk in chunks:
+            self._client.overwrite_payload(
+                self.collection_name(generation_id),
+                payload=chunk.model_dump(),
+                points=[str(uuid5(NAMESPACE_URL, chunk.chunk_id))],
+                wait=True,
+            )
+
+    def retire(self, generation_id: str) -> None:
+        name = self.collection_name(generation_id)
+        if any(item.collection_name == name for item in self._client.get_aliases().aliases):
+            raise RuntimeError("Refusing to delete a collection referenced by an alias")
+        if self.exists(generation_id):
+            self._client.delete_collection(name)
 
     def search(
         self,

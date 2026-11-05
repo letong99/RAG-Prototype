@@ -157,7 +157,7 @@ def test_semantic_pipeline_cache_and_configuration_versioning(tmp_path: Path) ->
         assert len(embedder.calls) == calls
         changed = config.model_copy(update={"semantic_min_distance": 2})
         third = IngestionPipeline(changed, embedder, store, manifest).ingest(
-            [document("x", TOPICS)]
+            [document("x", TOPICS)], full_rebuild=True
         )
         assert third.generation_id != first.generation_id
         assert third.chunks == 1

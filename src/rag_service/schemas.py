@@ -28,10 +28,14 @@ class SourceDocument(Record):
 class Document(SourceDocument):
     raw_text: str
     content_hash: str
+    metadata_hash: str = ""
     version: str
 
 
 class Chunk(Record):
+    generation_number: int = 0
+    written_revision: int = 0
+    processing_fingerprint: str = ""
     chunk_id: str
     document_id: str
     document_version: str
@@ -62,6 +66,11 @@ class EmbeddingSpec(Record):
 
 
 class IngestionResult(Record):
+    ingestion_revision: int = 0
+    generation_number: int = 0
+    skipped_documents: int = 0
+    updated_documents: int = 0
+    deleted_documents: int = 0
     generation_id: str
     collection: str
     status: Literal["ready", "unchanged"]
@@ -85,6 +94,10 @@ class IndexMetadata(Record):
     """Stored in Qdrant collection metadata so query workers need no local manifest."""
 
     generation_id: str
+    generation_number: int = 0
+    ingestion_revision: int = 0
+    coordinator_id: str = ""
+    processing_fingerprint: str = ""
     collection: str
     fingerprint: str
     embedding: EmbeddingSpec

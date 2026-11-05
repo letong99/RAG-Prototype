@@ -4,11 +4,12 @@
 
 Target the user's **existing remote Qdrant server**, using the official `qdrant-client` Python SDK.
 Read-only connectivity confirmed server/client version 1.20.0 and an empty server; no knowledge-base
-data was uploaded. Credentials reside in ignored local `.env`, not the example template.
+data was uploaded during that check. A subsequent [hosted smoke test](SMOKE_TEST_RESULTS.md)
+now retains 21 valid passages in `bioasq-semantic-smoke`. Credentials reside in ignored local `.env`, not the example template.
 
-The accepted next implementation is documented in [incremental ingestion and generation lifecycle](INCREMENTAL_INGESTION.md).
-It introduces incremental active-collection updates, controlled ingestion windows, and one inactive
-fallback. The whole-generation behavior described below remains the current implementation.
+The implemented single-host lifecycle is documented in [incremental ingestion and generation lifecycle](INCREMENTAL_INGESTION.md).
+It provides incremental active-collection updates, controlled ingestion windows, and one inactive
+fallback. Readers must use the coordinator gate and document manifest; direct SDK searches bypass it.
 
 The previous smoke index used Qdrant's official embedded/local implementation at `.data/qdrant`.
 That is useful for deterministic correctness tests, but it is not the production Qdrant server and
@@ -24,10 +25,12 @@ Normal ingestion fails if a remote URL is missing; it never silently falls back 
 | Active index version | Qdrant collection alias | Atomic alias publication |
 | Embedding model/revision and corpus counts/hash | Qdrant collection metadata | Available to independent readers |
 | Original source files and normalized exports | Versioned object storage in deployment | Currently local staging; object-storage adapter is future work |
-| Embedding cache and ingestion audit | Ingestion worker's persistent work volume | SQLite; not required by query/MCP workers |
+| Document manifest, admission gate, journal | One coordinator host's persistent work volume | SQLite lifecycle ledger and file locks; required by guarded readers |
+| Embedding cache and legacy ingestion audit | Coordinator work volume | Separate SQLite cache/audit |
 | Sparse/BM25 vectors | Same remote Qdrant service | Planned hybrid-search milestone |
 
-Local `.data/` is a worker workspace, not a database directory that the MCP server must mount.
+Local `.data/` now includes the authoritative coordinator ledger and journal. Guarded query/MCP
+workers must run on that host and share the directory until distributed coordination is implemented.
 It still holds reusable embedding-cache values and ingestion artifacts. Query workers obtain
 searchable text and citations directly from Qdrant. For local-file sources, replace laptop-specific
 `file://` source URIs with accessible, appropriately authorized source links before deployment.
@@ -50,7 +53,8 @@ starting point; Qdrant may choose a scan for small collections or selective filt
 parameters only after measuring remote latency and recall on the actual corpus.
 
 The current search adapter supports dense vector queries and document-ID filters. Hybrid search,
-query-text embedding orchestration, reranking, and the MCP adapter are not implemented yet.
+reranking and the MCP adapter are not implemented yet. Guarded query-text embedding is available
+through `RetrievalService.retrieve` with a matching supplied embedder.
 
 ## Query path for a future MCP deployment
 
@@ -58,17 +62,23 @@ query-text embedding orchestration, reranking, and the MCP adapter are not imple
 flowchart LR
     A[Remote agent] --> B[MCP service]
     B --> C[Authorize requested corpus]
-    C --> D[Resolve Qdrant alias and model metadata]
+    C --> W[Acquire coordinator retrieval gate]
+    W --> D[Pin committed revision and matching model]
     D --> E[Embed query with the matching model revision]
     E --> F[Qdrant query_points with filters]
-    F --> G[Rerank and assemble cited context]
-    G --> A
-    H[Ingestion worker] --> I[New Qdrant generation]
-    I --> J[Verify writes and publish alias]
-    J --> D
+    F --> V[Verify document versions against manifest]
+    V --> G[Rerank and assemble cited context]
+    G --> X[Release retrieval gate]
+    X --> A
+    H[Ingestion worker] --> I[Prepare changed documents or explicit full rebuild]
+    I --> J[Close admission and drain readers]
+    J --> K[Apply, verify, commit revision]
+    K --> W
 ```
 
-The query adapter already delegates the actual retrieval operation to the SDK:
+The low-level query adapter delegates retrieval to the SDK. The following illustrates that adapter
+only; production callers must wrap the full request in `RetrievalService.retrieve` as shown in the
+README to participate in maintenance gating and manifest checks:
 
 ```python
 index = store.active_index("bioasq")
@@ -104,7 +114,8 @@ source .venv/bin/activate
 rag storage-status --collection bioasq
 
 # After reviewing chunking and selecting the actual source set:
-rag ingest --documents PATH_TO_DOCUMENTS_JSONL --collection bioasq
+rag ingest --documents PATH_TO_DOCUMENTS_JSONL --collection bioasq \
+  --available-storage-bytes "$QDRANT_FREE_BYTES"
 
 # Explicit development-only alternative:
 rag ingest --storage embedded --directory tests/fixtures/documents --collection example
@@ -117,20 +128,22 @@ predates remote alias publication and has not been migrated automatically.
 
 ## Publication and failure behavior
 
-Build one physical collection per corpus generation, store its model metadata, upload all chunks,
-and verify its count. Then switch `rag_active_COLLECTION` using Qdrant's atomic alias-operation API.
-The metadata and points are already present before that generation becomes discoverable. Keep
-previous generations until requests pinned to them finish; automated garbage collection is future work.
+Routine ingestion patches only the active collection, with a durable SQLite journal and checksummed
+replay files. Unchanged documents skip chunking/embedding; explicit deletion IDs remove obsolete
+chunks. All remote mutation runs under a retrieval gate, followed by full payload/ID verification.
+Failures keep maintenance enabled; `rag recover` replays the same operation without embedding.
 
-SQLite records the ingestion audit after remote publication. A failed publication response may be
-ambiguous: the server might have committed the alias. Such a run is marked `publication_pending`,
-not automatically treated as a failed index. A subsequent run reconciles it when the alias confirms
-the generation. If it cannot confirm that state, ingestion stops for operator inspection rather
-than issuing another blind switch. The remote alias remains the source of truth.
+Explicit full rebuilds create a physical collection and switch active/inactive aliases atomically.
+The previous active becomes fallback; the older fallback is retired after commit. Alias operations
+and SQLite publication are reconciled by the journal, not a cross-database transaction. `rag rollback`
+explicitly activates the older snapshot and matching manifest/model configuration at a new revision.
+The displaced active is quarantined without a fallback alias. `rag cleanup` removes retired owned
+collections, preserving active/fallback and refusing cleanup during unresolved ingestion.
 
-Use **one ingestion writer per corpus** in the deployment scheduler. The local file lock only protects
-one work directory; it is not a distributed lock, and Qdrant alias updates are not a compare-and-swap
-writer-election mechanism. Multiple MCP readers are independent of that writer.
+One coordinator directory on one host is required. Readers hold `RetrievalService.retrieve` open
+through context assembly; requests are currently serialized. Separate local ledgers cannot safely
+coordinate a mutable collection and are rejected. A future shared PostgreSQL coordinator must replace
+this gate before deploying multiple independent MCP hosts. Direct Qdrant access bypasses admission.
 
 ## Verification and remaining deployment work
 

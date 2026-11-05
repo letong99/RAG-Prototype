@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from rag_service.ingestion.validation import BIOASQ_DATASET_ID, missing_passage
 from rag_service.schemas import EvaluationQuestion, SourceDocument
 
-DATASET_ID = "rag-datasets/rag-mini-bioasq"
+DATASET_ID = BIOASQ_DATASET_ID
 
 
 def passage_ids(value: object) -> list[str]:
@@ -52,7 +53,7 @@ def export_rows(
                 raise ValueError(f"Duplicate corpus passage ID: {document_id}")
             seen.add(document_id)
             text = row["passage"]
-            if not isinstance(text, str) or not text.strip():
+            if missing_passage(text):
                 failures.write(
                     json.dumps({"document_id": document_id, "reason": "missing_text"}) + "\n"
                 )
@@ -122,6 +123,13 @@ def read_documents(path: Path) -> Iterator[SourceDocument]:
     with path.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
             try:
-                yield SourceDocument.model_validate_json(line)
+                document = SourceDocument.model_validate_json(line)
+                if document.metadata.get("dataset") == DATASET_ID and missing_passage(
+                    document.text
+                ):
+                    raise ValueError(
+                        "BioASQ passage contains placeholder text; re-export the dataset"
+                    )
+                yield document
             except ValueError as error:
                 raise ValueError(f"Invalid document at {path}:{line_number}: {error}") from error

@@ -23,12 +23,28 @@ def parser() -> argparse.ArgumentParser:
         "--max-passages", type=int, help="Smoke-test subset; unsuitable for evaluation"
     )
     ingest = commands.add_parser(
-        "ingest", help="Replace a collection with a complete source snapshot"
+        "ingest", help="Incrementally add/update documents; absent documents are retained"
     )
-    source = ingest.add_mutually_exclusive_group(required=True)
+    source = ingest.add_mutually_exclusive_group()
     source.add_argument("--directory", type=Path)
     source.add_argument("--documents", type=Path, help="SourceDocument JSONL, not QA labels")
     ingest.add_argument("--collection", default="default")
+    ingest.add_argument(
+        "--full-rebuild",
+        action="store_true",
+        help="Build a new generation from the complete supplied corpus",
+    )
+    ingest.add_argument(
+        "--delete-document-id",
+        action="append",
+        default=[],
+        help="Explicit incremental deletion; repeat for multiple IDs",
+    )
+    ingest.add_argument(
+        "--available-storage-bytes",
+        type=int,
+        help="Measured server free space; required for remote full builds",
+    )
     _chunking_arguments(ingest)
     _storage_arguments(ingest)
     ingest.add_argument("--allow-empty", action="store_true", help="Permit clearing the collection")
@@ -46,6 +62,14 @@ def parser() -> argparse.ArgumentParser:
     )
     remote_status.add_argument("--collection", default="default")
     _storage_arguments(remote_status)
+    for name, help_text in (
+        ("recover", "Replay a pending ingestion without embedding"),
+        ("rollback", "Explicitly restore the older inactive snapshot; recent changes may be lost"),
+        ("cleanup", "Remove retired committed collections; preserve active and fallback"),
+    ):
+        maintenance = commands.add_parser(name, help=help_text)
+        maintenance.add_argument("--collection", default="default")
+        _storage_arguments(maintenance)
     return root
 
 
@@ -106,11 +130,38 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     manifest = Manifest(args.data_dir / "manifest.sqlite3")
     try:
+        if args.command in {"recover", "rollback", "cleanup"}:
+            from rag_service.ingestion.maintenance import cleanup, rollback
+            from rag_service.ingestion.recovery import recover
+            from rag_service.storage.qdrant import QdrantVectorStore
+
+            store = QdrantVectorStore.connect(_storage_settings(args), args.data_dir)
+            try:
+                if args.command == "cleanup":
+                    return {"retired": cleanup(args.data_dir, args.collection, store)}
+                action = rollback if args.command == "rollback" else recover
+                return {
+                    "active": action(args.data_dir, args.collection, store, manifest).model_dump()
+                }
+            finally:
+                store.close()
         if args.command == "status":
-            return {
-                "active": manifest.active(args.collection),
-                "history": manifest.generations(args.collection),
-            }
+            from rag_service.ingestion.lifecycle import Ledger
+
+            ledger = Ledger(args.data_dir)
+            try:
+                active = ledger.active(args.collection)
+                fallback = ledger.active(args.collection, fallback=True)
+                pending = ledger.pending(args.collection)
+                return {
+                    "active": active.model_dump() if active else None,
+                    "fallback": fallback.model_dump() if fallback else None,
+                    "maintenance": pending is not None,
+                    "pending_operation": pending.operation_id if pending else None,
+                    "history": manifest.generations(args.collection),
+                }
+            finally:
+                ledger.close()
         return _process(args, manifest)
     finally:
         manifest.close()
@@ -125,6 +176,13 @@ def _process(args: argparse.Namespace, manifest: Manifest) -> dict[str, object]:
 
     # Validate the target before loading or downloading an embedding model.
     storage_settings = None if args.command == "preview-chunks" else _storage_settings(args)
+    if args.command == "ingest" and not (
+        args.directory
+        or args.documents
+        or args.delete_document_id
+        or (args.full_rebuild and args.allow_empty)
+    ):
+        raise ValueError("Supply documents, a directory, or explicit document deletions")
     config = IngestionConfig(
         data_dir=args.data_dir,
         collection=args.collection,
@@ -155,10 +213,18 @@ def _process(args: argparse.Namespace, manifest: Manifest) -> dict[str, object]:
     store = QdrantVectorStore.connect(storage_settings, config.data_dir)
     try:
         sources = (
-            read_directory(args.directory) if args.directory else read_documents(args.documents)
+            read_directory(args.directory)
+            if args.directory
+            else read_documents(args.documents)
+            if args.documents
+            else []
         )
         result = IngestionPipeline(config, embedder, store, manifest).ingest(
-            sources, allow_empty=args.allow_empty
+            sources,
+            allow_empty=args.allow_empty,
+            full_rebuild=args.full_rebuild,
+            delete_document_ids=args.delete_document_id,
+            available_storage_bytes=args.available_storage_bytes,
         )
         return result.model_dump()
     finally:

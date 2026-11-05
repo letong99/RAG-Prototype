@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -26,14 +25,17 @@ def test_snapshot_update_delete_and_cache(
     pipeline: IngestionPipeline, embedder: FakeEmbedder
 ) -> None:
     first = pipeline.ingest([document("a"), document("b", "Old policy for weekly backups.")])
-    updated = pipeline.ingest([document("a"), document("c", "New policy applies every Friday.")])
-    assert updated.generation_id != first.generation_id
-    assert updated.cached_chunks == 1
+    updated = pipeline.ingest(
+        [document("a"), document("c", "New policy applies every Friday.")],
+        delete_document_ids=["b"],
+    )
+    assert updated.generation_id == first.generation_id
+    assert updated.cached_chunks == 0
+    assert updated.skipped_documents == 1
     assert updated.embedded_chunks == 1
-    path = pipeline.config.data_dir / "generations" / updated.generation_id / "documents.jsonl"
-    ids = {json.loads(line)["document_id"] for line in path.read_text().splitlines()}
+    ids = {chunk.document_id for chunk in pipeline.store.iter_chunks(updated.generation_id)}
     assert ids == {"a", "c"}
-    assert pipeline.manifest.active("default")["id"] == updated.generation_id
+    assert pipeline.store.active_index("default").ingestion_revision == 2
 
 
 def test_failure_leaves_previous_generation_active_and_retry_works(
@@ -43,7 +45,7 @@ def test_failure_leaves_previous_generation_active_and_retry_works(
     embedder.fail = True
     with pytest.raises(RuntimeError, match="inference"):
         pipeline.ingest([document("changed", "Completely different passage.")])
-    assert pipeline.manifest.active("default")["id"] == first.generation_id
+    assert pipeline.store.active_index("default").generation_id == first.generation_id
     assert pipeline.manifest.generations("default")[0]["status"] == "failed"
     embedder.fail = False
     retried = pipeline.ingest([document("changed", "Completely different passage.")])
@@ -62,7 +64,7 @@ def test_invalid_input_does_not_publish(pipeline: IngestionPipeline) -> None:
 
 def test_clear_requires_explicit_opt_in(pipeline: IngestionPipeline) -> None:
     pipeline.ingest([document("a")])
-    cleared = pipeline.ingest([], allow_empty=True)
+    cleared = pipeline.ingest([], allow_empty=True, full_rebuild=True)
     assert cleared.documents == cleared.chunks == 0
     assert pipeline.store.count(cleared.generation_id) == 0
 
@@ -81,7 +83,9 @@ def test_model_revision_invalidates_cache(
 ) -> None:
     pipeline.ingest([document("a")])
     embedder.spec = EmbeddingSpec(model="test-only", revision="v2", dimension=4, max_tokens=512)
-    updated = pipeline.ingest([document("a")])
+    with pytest.raises(ValueError, match="full-rebuild"):
+        pipeline.ingest([document("a")])
+    updated = pipeline.ingest([document("a")], full_rebuild=True)
     assert updated.status == "ready"
     assert updated.embedded_chunks == 1
 
@@ -98,7 +102,7 @@ def test_vector_count_mismatch_prevents_publication(
     monkeypatch.setattr(pipeline.store, "count", lambda generation: 0)
     with pytest.raises(RuntimeError, match="count"):
         pipeline.ingest([document("b", "New source text.")])
-    assert pipeline.manifest.active("default")["id"] == previous.generation_id
+    assert pipeline.store.active_index("default").generation_id == previous.generation_id
 
 
 def test_source_order_does_not_change_snapshot(pipeline: IngestionPipeline) -> None:

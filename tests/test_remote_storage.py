@@ -7,8 +7,10 @@ from conftest import FakeEmbedder, WordTokenizer, document
 from rag_service.chunking.token_chunker import TokenChunker
 from rag_service.cli import main
 from rag_service.config import QdrantSettings
+from rag_service.ingestion.lifecycle import Ledger
 from rag_service.ingestion.normalization import normalize
 from rag_service.ingestion.pipeline import IngestionPipeline
+from rag_service.ingestion.recovery import recover
 from rag_service.schemas import IndexMetadata
 from rag_service.storage.manifest import Manifest
 from rag_service.storage.qdrant import QdrantVectorStore
@@ -98,7 +100,7 @@ def test_alias_metadata_is_readable_without_local_ingestion_manifest(
 def test_alias_switch_does_not_change_a_pinned_reader(pipeline: IngestionPipeline) -> None:
     first = pipeline.ingest([document("a")])
     pinned = pipeline.store.active_index("default")
-    second = pipeline.ingest([document("b", "Another document.")])
+    second = pipeline.ingest([document("b", "Another document.")], full_rebuild=True)
     assert pinned is not None
     assert pinned.generation_id == first.generation_id
     assert pipeline.store.active_index("default").generation_id == second.generation_id
@@ -119,8 +121,11 @@ def test_lost_publication_acknowledgment_reconciles_on_retry(
         pipeline.ingest([document("a")])
     active = pipeline.store.active_index("default")
     assert active is not None
-    assert pipeline.manifest.pending_publications("default")
+    ledger = Ledger(pipeline.config.data_dir)
+    assert ledger.pending("default")
+    ledger.close()
     monkeypatch.setattr(pipeline.store, "publish", publish)
+    recover(pipeline.config.data_dir, "default", pipeline.store, pipeline.manifest)
     retried = pipeline.ingest([document("a")])
     assert retried.status == "unchanged"
     assert retried.generation_id == active.generation_id
@@ -137,7 +142,7 @@ def test_ambiguous_publication_prevents_blind_republication(
 
     monkeypatch.setattr(pipeline.store, "publish", timeout)
     with pytest.raises(TimeoutError):
-        pipeline.ingest([document("b", "Changed content.")])
+        pipeline.ingest([document("b", "Changed content.")], full_rebuild=True)
     assert pipeline.store.active_index("default").generation_id == first.generation_id
-    with pytest.raises(RuntimeError, match="unresolved"):
-        pipeline.ingest([document("b", "Changed content.")])
+    with pytest.raises(RuntimeError, match="Unresolved"):
+        pipeline.ingest([document("b", "Changed content.")], full_rebuild=True)

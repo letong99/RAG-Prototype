@@ -5,7 +5,7 @@ Status: Proposed prototype plan
 
 Accepted lifecycle update: [incremental ingestion and generation lifecycle](docs/INCREMENTAL_INGESTION.md).
 That design supersedes full-generation rebuilds as the planned default for ordinary updates;
-explicit full rebuilds remain for processing changes. Runtime implementation is pending.
+explicit full rebuilds remain for processing changes. Implemented for a single-host coordinator; distributed coordination remains future work.
 
 ## 1. Objective and scope
 

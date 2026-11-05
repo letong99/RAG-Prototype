@@ -1,11 +1,6 @@
-"""Stage a full corpus snapshot, reuse embeddings, then atomically publish its generation."""
+"""Incremental document ingestion with explicit full rebuilds and durable replay."""
 
-import json
-import logging
-import os
-from collections.abc import Iterable, Iterator
-from itertools import batched
-from pathlib import Path
+from collections.abc import Iterable, Sequence
 from uuid import uuid4
 
 from filelock import FileLock
@@ -13,12 +8,18 @@ from filelock import FileLock
 from rag_service.chunking.factory import create_chunker
 from rag_service.config import IngestionConfig
 from rag_service.embeddings.cached import CachedEmbedder
+from rag_service.ingestion.lifecycle import Ledger, Operation
 from rag_service.ingestion.normalization import NORMALIZER_VERSION, normalize
+from rag_service.ingestion.recovery import apply_operation
+from rag_service.ingestion.staging import Stager, seal
 from rag_service.ports import Embedder, VectorStore
-from rag_service.schemas import Chunk, IndexMetadata, IngestionResult, SourceDocument, fingerprint
+from rag_service.schemas import (
+    IndexMetadata,
+    IngestionResult,
+    SourceDocument,
+    fingerprint,
+)
 from rag_service.storage.manifest import Manifest
-
-logger = logging.getLogger(__name__)
 
 
 class IngestionPipeline:
@@ -34,35 +35,8 @@ class IngestionPipeline:
         self.cached_embedder = CachedEmbedder(embedder, manifest, config.batch_size)
         self.chunker = create_chunker(config, self.cached_embedder)
 
-    def ingest(
-        self, sources: Iterable[SourceDocument], *, allow_empty: bool = False
-    ) -> IngestionResult:
-        self.config.data_dir.mkdir(parents=True, exist_ok=True)
-        with FileLock(self.config.data_dir / "ingestion.lock", timeout=0):
-            self.manifest.recover()
-            self._reconcile_publication()
-            return self._ingest(sources, allow_empty=allow_empty)
-
-    def _reconcile_publication(self) -> None:
-        for pending in self.manifest.pending_publications(self.config.collection):
-            active = self.store.active_index(self.config.collection)
-            if active is None or active.generation_id != pending["id"]:
-                raise RuntimeError(
-                    "Previous publication is unresolved. Inspect Qdrant's active alias and the "
-                    "publication_pending audit record before starting another ingestion."
-                )
-            self.manifest.finish(
-                active.generation_id,
-                active.fingerprint,
-                active.documents,
-                active.chunks,
-                publish=True,
-            )
-
-    def _ingest(self, sources: Iterable[SourceDocument], *, allow_empty: bool) -> IngestionResult:
-        generation = uuid4().hex
-        self.cached_embedder.reset_stats()
-        settings = {
+    def settings(self) -> dict[str, object]:
+        return {
             "embedding": self.embedder.spec.model_dump(),
             "chunker": self.chunker.version,
             "chunk_tokens": self.config.chunk_tokens,
@@ -73,108 +47,177 @@ class IngestionPipeline:
             "semantic_window_sentences": self.config.semantic_window_sentences,
             "normalizer": NORMALIZER_VERSION,
         }
-        self.manifest.begin(generation, self.config.collection, settings)
-        directory = self.config.data_dir / "generations" / generation
-        publication_attempted = False
+
+    def ingest(
+        self,
+        sources: Iterable[SourceDocument],
+        *,
+        allow_empty: bool = False,
+        full_rebuild: bool = False,
+        delete_document_ids: Sequence[str] = (),
+        available_storage_bytes: int | None = None,
+    ) -> IngestionResult:
+        self.config.data_dir.mkdir(parents=True, exist_ok=True)
+        with FileLock(self.config.data_dir / "ingestion.lock", timeout=0):
+            ledger = Ledger(self.config.data_dir)
+            try:
+                if ledger.pending(self.config.collection):
+                    raise RuntimeError("Unresolved ingestion; run recover before another update")
+                self.manifest.recover()
+                return self._ingest(
+                    ledger,
+                    sources,
+                    allow_empty,
+                    full_rebuild,
+                    delete_document_ids,
+                    available_storage_bytes,
+                )
+            finally:
+                ledger.close()
+
+    def _ingest(
+        self,
+        ledger: Ledger,
+        sources: Iterable[SourceDocument],
+        allow_empty: bool,
+        full_rebuild: bool,
+        delete_ids: Sequence[str],
+        available_storage_bytes: int | None,
+    ) -> IngestionResult:
+        active = self.store.active_index(self.config.collection)
+        local = ledger.active(self.config.collection)
+        if active != local:
+            raise RuntimeError(
+                "Remote index and local manifest disagree; restore the coordinator "
+                "manifest or migrate the legacy index to a new corpus name"
+            )
+        if active and active.coordinator_id != ledger.identity:
+            raise RuntimeError("This corpus belongs to another ingestion coordinator")
+        processing = fingerprint(self.settings())
+        full = full_rebuild or active is None
+        if active and not full and active.processing_fingerprint != processing:
+            raise ValueError("Processing configuration changed; explicitly use --full-rebuild")
+        if (
+            full
+            and self.store.remote
+            and (available_storage_bytes is None or available_storage_bytes <= 0)
+        ):
+            raise ValueError("Remote full builds require measured --available-storage-bytes")
+        if full and delete_ids:
+            raise ValueError("Full rebuild takes a complete source set, not deletion patches")
+        old = ledger.entries(active.generation_id) if active else {}
+        target = {} if full else dict(old)
+        changed = []
+        skipped = 0
+        seen: set[str] = set()
+        for source in sources:
+            document = normalize(source)
+            key = document.document_id
+            if key in seen:
+                raise ValueError(f"Duplicate document ID: {key}")
+            seen.add(key)
+            previous = old.get(key)
+            if not full and previous and previous.document.version == document.version:
+                skipped += 1
+            else:
+                changed.append(document)
+        deleted = set(delete_ids)
+        if deleted & seen:
+            raise ValueError("A document cannot be supplied and deleted in the same operation")
+        for key in deleted:
+            target.pop(key, None)
+        if not target and not changed and not allow_empty:
+            raise ValueError("Refusing to publish an empty corpus; explicitly allow it to clear")
+        removed = len(deleted & old.keys())
+        if active and not full and not changed and not removed:
+            return IngestionResult(
+                generation_id=active.generation_id,
+                status="unchanged",
+                collection=active.collection,
+                documents=active.documents,
+                chunks=active.chunks,
+                skipped_documents=skipped,
+                ingestion_revision=active.ingestion_revision,
+                generation_number=active.generation_number,
+            )
+        number, revision = ledger.allocate(self.config.collection, full=full)
+        if full:
+            generation = uuid4().hex
+        else:
+            assert active is not None
+            generation = active.generation_id
+            number = active.generation_number
+        operation_id = uuid4().hex
+        directory = ledger.data_dir / "operations" / operation_id
+        directory.mkdir(parents=True)
+        self.manifest.begin(operation_id, self.config.collection, self.settings())
+        self.cached_embedder.reset_stats()
         try:
-            directory.mkdir(parents=True)
-            identities, chunk_count = self._stage(sources, directory)
-            semantic_stats = {
-                "semantic_embedded_texts": self.cached_embedder.computed_texts,
-                "semantic_cached_texts": self.cached_embedder.reused_texts,
-            }
-            logger.info("Staged %d documents and %d chunks", len(identities), chunk_count)
-            if not identities and not allow_empty:
-                raise ValueError(
-                    "Refusing to publish an empty corpus; explicitly allow it to clear"
-                )
-            corpus_hash = fingerprint([settings, sorted(identities.items())])
-            active = self.store.active_index(self.config.collection)
-            if active and active.fingerprint == corpus_hash:
-                self.manifest.finish(
-                    generation, corpus_hash, len(identities), chunk_count, publish=False
-                )
-                return IngestionResult(
-                    generation_id=active.generation_id,
-                    collection=self.config.collection,
-                    status="unchanged",
-                    documents=len(identities),
-                    chunks=chunk_count,
-                    **semantic_stats,
-                )
+            stats = Stager(
+                self.chunker, self.cached_embedder, self.store, self.config.batch_size
+            ).stage(
+                directory,
+                changed,
+                old,
+                target,
+                deleted,
+                full=full,
+                generation=generation,
+                number=number,
+                revision=revision,
+                processing=processing,
+            )
             index = IndexMetadata(
                 generation_id=generation,
+                generation_number=number,
+                ingestion_revision=revision,
+                coordinator_id=ledger.identity,
+                processing_fingerprint=processing,
                 collection=self.config.collection,
-                fingerprint=corpus_hash,
                 embedding=self.embedder.spec,
-                documents=len(identities),
-                chunks=chunk_count,
+                documents=len(target),
+                chunks=sum(len(e.chunk_hashes) for e in target.values()),
+                fingerprint=fingerprint(
+                    [processing, sorted((k, e.document.version) for k, e in target.items())]
+                ),
             )
-            self.store.create(generation, self.embedder.spec.dimension, metadata=index)
-            embedded = cached = 0
-            for batch in batched(read_chunks(directory / "chunks.jsonl"), self.config.batch_size):
-                before = self.cached_embedder.computed_texts
-                vectors = self.cached_embedder.embed([chunk.text for chunk in batch])
-                new_count = self.cached_embedder.computed_texts - before
-                self.store.write(generation, batch, vectors)
-                embedded += new_count
-                cached += len(batch) - new_count
-                if (embedded + cached) % (10 * self.config.batch_size) == 0:
-                    logger.info("Indexed %d/%d chunks", embedded + cached, chunk_count)
-            if self.store.count(generation) != chunk_count:
-                raise RuntimeError("Stored vector count does not match staged chunk count")
-            self.manifest.publication_pending(generation)
-            publication_attempted = True
-            self.store.publish(index)
-            self.manifest.finish(
-                generation, corpus_hash, len(identities), chunk_count, publish=True
+            # The SDK does not expose hosting-plan free disk. Require an operator measurement for
+            # remote builds and compare it with a conservative estimate, not a claimed exact size.
+            if self.store.remote and (full or available_storage_bytes is not None):
+                estimated = stats.estimated_storage_bytes
+                if available_storage_bytes is None or available_storage_bytes < estimated:
+                    raise ValueError(
+                        f"Remote ingestion needs sufficient --available-storage-bytes from current "
+                        f"server metrics (estimated required headroom: {estimated})"
+                    )
+            operation = Operation(
+                operation_id=operation_id,
+                kind="full" if full else "incremental",
+                index=index,
+                previous=active,
+                fallback=ledger.active(self.config.collection, fallback=True),
+                directory=str(directory),
+                checksums=seal(directory),
             )
-            logger.info(
-                "Published %s: %d documents, %d chunks", generation, len(identities), chunk_count
-            )
-            return IngestionResult(
-                generation_id=generation,
-                collection=self.config.collection,
-                status="ready",
-                documents=len(identities),
-                chunks=chunk_count,
-                embedded_chunks=embedded,
-                cached_chunks=cached,
-                **semantic_stats,
-            )
+            ledger.begin(operation)
+            apply_operation(ledger, self.store, self.manifest, operation)
         except Exception as error:
-            message = f"{type(error).__name__}: {error}"
-            if publication_attempted:
-                self.manifest.publication_pending(generation, message)
-            else:
-                self.manifest.fail(generation, message)
+            if ledger.pending(self.config.collection) is None:
+                self.manifest.fail(operation_id, type(error).__name__)
             raise
-
-    def _stage(
-        self, sources: Iterable[SourceDocument], directory: Path
-    ) -> tuple[dict[str, str], int]:
-        identities: dict[str, str] = {}
-        count = 0
-        with (
-            (directory / "documents.jsonl").open("w", encoding="utf-8") as documents,
-            (directory / "chunks.jsonl").open("w", encoding="utf-8") as chunks,
-        ):
-            for source in sources:
-                document = normalize(source)
-                if document.document_id in identities:
-                    raise ValueError(f"Duplicate document ID: {document.document_id}")
-                identities[document.document_id] = document.version
-                documents.write(document.model_dump_json() + "\n")
-                for chunk in self.chunker.chunks(document):
-                    chunks.write(chunk.model_dump_json() + "\n")
-                    count += 1
-            for stream in (documents, chunks):
-                stream.flush()
-                os.fsync(stream.fileno())
-        return identities, count
-
-
-def read_chunks(path: Path) -> Iterator[Chunk]:
-    with path.open(encoding="utf-8") as stream:
-        for line in stream:
-            yield Chunk.model_validate(json.loads(line))
+        return IngestionResult(
+            generation_id=generation,
+            collection=index.collection,
+            status="ready",
+            documents=index.documents,
+            chunks=index.chunks,
+            ingestion_revision=revision,
+            generation_number=number,
+            skipped_documents=skipped,
+            updated_documents=len(changed),
+            deleted_documents=removed,
+            embedded_chunks=stats.embedded,
+            cached_chunks=stats.cached,
+            semantic_embedded_texts=stats.semantic_computed,
+            semantic_cached_texts=stats.semantic_cached,
+        )
