@@ -1,0 +1,50 @@
+{
+  "strategy": "semantic",
+  "model": {
+    "model": "BAAI/bge-small-en-v1.5",
+    "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    "dimension": 384,
+    "max_tokens": 510,
+    "normalized": true
+  },
+  "max_chunk_tokens": 300,
+  "chunks": [
+    {
+      "chunk_id": "a3bd843b9d3505fa512cde907aca9022505d9bcd84051bcf9d0dcc0c9834a585",
+      "document_id": "topics.txt",
+      "document_version": "e534ca2aead3fc95ac951fa7ac3334a06e051f5ed3851adef0c16b86d8655074",
+      "position": 0,
+      "text": "BRCA1 participates in DNA repair. Mutations in this gene increase the risk of breast cancer. Genetic testing can identify inherited variants associated with cancer susceptibility.",
+      "start_char": 0,
+      "end_char": 179,
+      "token_count": 33,
+      "source_uri": "file:///Users/letong/Desktop/code/RAG/tests/fixtures/chunking/topics.txt",
+      "title": "topics",
+      "heading": "",
+      "page": null,
+      "metadata": {},
+      "semantic_group_id": "727f8085cd515a9190ad1c13617e56ba259f2b324e5101a1e27e5e4163b67838",
+      "split_reason": "semantic"
+    },
+    {
+      "chunk_id": "c2a05a74cf6f9c9bcddcbe1462c7af7e72ca24c0189e685cb5308f231c65218a",
+      "document_id": "topics.txt",
+      "document_version": "e534ca2aead3fc95ac951fa7ac3334a06e051f5ed3851adef0c16b86d8655074",
+      "position": 1,
+      "text": "Database backups protect stored records against accidental deletion. Daily backup snapshots are retained for thirty days. Administrators test restoration procedures to verify that the saved data can be recovered.",
+      "start_char": 181,
+      "end_char": 393,
+      "token_count": 37,
+      "source_uri": "file:///Users/letong/Desktop/code/RAG/tests/fixtures/chunking/topics.txt",
+      "title": "topics",
+      "heading": "",
+      "page": null,
+      "metadata": {},
+      "semantic_group_id": "43eee02a7dd8ad72e4738d5f7e2666488289ab26ce2a047879f2831c13432381",
+      "split_reason": "semantic"
+    }
+  ],
+  "semantic_embedded_texts": 7,
+  "semantic_cached_texts": 3,
+  "indexed": false
+}

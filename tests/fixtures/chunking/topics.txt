@@ -1,0 +1,3 @@
+BRCA1 participates in DNA repair. Mutations in this gene increase the risk of breast cancer. Genetic testing can identify inherited variants associated with cancer susceptibility.
+
+Database backups protect stored records against accidental deletion. Daily backup snapshots are retained for thirty days. Administrators test restoration procedures to verify that the saved data can be recovered.
