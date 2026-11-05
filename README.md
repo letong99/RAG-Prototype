@@ -235,3 +235,18 @@ the code. Run status inspection without loading the embedding model.
 Retrieval and optional CrossEncoder reranking are available with an offline human-review
 workflow. See [retrieval usage and evaluation](docs/RETRIEVAL.md). Wait for the full ingestion
 to finish before exporting results from the hosted collection.
+
+### Context assembly and optional answers
+
+The Python service exposes `retrieve_context`, `answer_question` (with an injected generation
+provider), and `describe_dataset` for exact published inventory. Context includes stable citations,
+versioned source locations, token/byte limits, and omission information. See
+[context, generation, and dataset overview design](docs/CONTEXT_AND_GENERATION.md) for usage,
+provider responsibilities, and the recommended hierarchical approach to corpus-wide summaries.
+
+### Local MCP access
+
+Run `rag-mcp` as a stdio MCP server from Codex or Claude Code. Its `retrieve_context` tool returns
+assembled, cited evidence plus response latency and query/result token estimates, and saves query
+metrics to `.data/query_metrics.jsonl`. See [local MCP setup](docs/LOCAL_MCP.md) for installation,
+client registration commands, limits, and metric definitions.

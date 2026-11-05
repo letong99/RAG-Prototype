@@ -175,6 +175,11 @@ Authorize the requested corpus before searching. Apply all applicable metadata a
 
 ## 8. Context assembly and optional generation
 
+Implemented: budgeted citation-preserving assembly, provider-neutral optional generation,
+versioned grounding prompt, structural citation validation, and exact dataset inventory.
+See [implementation and dataset overview design](docs/CONTEXT_AND_GENERATION.md).
+A concrete generation provider and hierarchical semantic corpus summaries remain future work.
+
 The assembler should:
 
 - Remove duplicate or heavily overlapping passages.

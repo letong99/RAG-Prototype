@@ -7,8 +7,11 @@ from pathlib import Path
 from time import perf_counter
 
 from rag_service.ingestion.lifecycle import Ledger, payload_hash
-from rag_service.ports import Embedder
+from rag_service.ports import Embedder, Tokenizer
+from rag_service.retrieval.context import ContextAssembler, ContextLimits, ContextResult
+from rag_service.retrieval.generation import AnswerGenerator, AnswerResult, generate_answer
 from rag_service.retrieval.models import RankedPassage, SearchRequest, SearchResult
+from rag_service.retrieval.overview import DatasetDescription
 from rag_service.retrieval.ranking import Reranker
 from rag_service.schemas import IndexMetadata, SearchHit
 from rag_service.storage.qdrant import QdrantVectorStore
@@ -18,6 +21,63 @@ class RetrievalService:
     def __init__(self, data_dir: Path, store: QdrantVectorStore) -> None:
         self.data_dir = data_dir
         self.store = store
+
+    def retrieve_context(
+        self,
+        request: SearchRequest,
+        embedder: Embedder,
+        *,
+        limits: ContextLimits | None = None,
+        tokenizer: Tokenizer | None = None,
+        reranker: Reranker | None = None,
+    ) -> ContextResult:
+        # Assemble from the full ranked pool so duplicates cannot crowd out evidence.
+        pool = request.model_copy(update={"top_n": request.candidate_limit})
+        result = self.search(pool, embedder, reranker=reranker)
+        effective = limits or ContextLimits(max_passages=request.top_n)
+        return ContextAssembler(tokenizer or embedder.tokenizer).assemble(result, effective)
+
+    def answer_question(
+        self,
+        request: SearchRequest,
+        embedder: Embedder,
+        generator: AnswerGenerator,
+        *,
+        limits: ContextLimits | None = None,
+        tokenizer: Tokenizer | None = None,
+        reranker: Reranker | None = None,
+    ) -> AnswerResult:
+        context = self.retrieve_context(
+            request, embedder, limits=limits, tokenizer=tokenizer, reranker=reranker
+        )
+        # Immutable evidence is already pinned to a revision; do not hold ingestion
+        # admission while waiting for an external generation provider.
+        return generate_answer(context, generator)
+
+    def describe_dataset(self, collection: str) -> "DatasetDescription":
+        """Exact published inventory; deliberately makes no inferred topic claims."""
+        ledger = Ledger(self.data_dir)
+        try:
+            with ledger.admission(collection) as index:
+                if (
+                    index.coordinator_id != ledger.identity
+                    or self.store.active_index(collection) != index
+                ):
+                    raise RuntimeError("Remote publication and coordinator manifest disagree")
+                entries = ledger.entries(index.generation_id)
+                return DatasetDescription(
+                    index=index,
+                    documents=len(entries),
+                    chunks=sum(len(entry.chunk_hashes) for entry in entries.values()),
+                    languages=sorted(
+                        {
+                            entry.document.metadata.get("language", "unknown")
+                            for entry in entries.values()
+                        }
+                    ),
+                )
+        finally:
+            ledger.close()
 
     def search(
         self, request: SearchRequest, embedder: Embedder, *, reranker: Reranker | None = None
